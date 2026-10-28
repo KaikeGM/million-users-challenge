@@ -30,7 +30,7 @@ Instead of the standard `net/http` model (1 goroutine and 2 buffered I/O streams
 3. **Pipelined Batching (`pgx.Batch`) & Late Materialization:**
    - DB workers drain up to 32 queued requests from the channel and pipeline them in a single `pgx.Batch` round-trip.
    - `/feed` uses CTE late materialization (`WITH page AS (...)`) to fetch top 20 posts before joining users and likes, preventing table scan regression under concurrent inserts.
-   - DB connection configured with `plan_cache_mode = force_generic_plan` and `jit = off`.
+   - DB connection configured with `plan_cache_mode = force_generic_plan`, `jit = off`, `max_parallel_workers_per_gather = 0`, and `enable_seqscan = off`.
 
 4. **Zero-Allocation HTTP Parsing & Fast Body Extraction:**
    - Custom zero-alloc HTTP/1.1 byte-level parser using `bytes.Equal` method detection and `bytes.EqualFold` header matching.
@@ -39,8 +39,10 @@ Instead of the standard `net/http` model (1 goroutine and 2 buffered I/O streams
    - Direct byte buffer formatting for JSON responses (no reflection, zero `encoding/json` serialization overhead on hot paths).
    - `zerojwt/v2` validates token signatures and claims without heap allocations.
 
-5. **Bounded Database Worker Pool with Batch Coalescing & Slow-Client Timeout:**
-   - Dedicated worker pool (`min(64, 4 x cores)`) coalescing batches across a connection pool of `min(384, max(128, 24 x cores))` within the 512-connection spec limit.
-   - Micro-linger (100 µs on sub-threshold batches) and 65k channel capacity eliminate worker contention and maximize throughput.
+5. **Strict Read/Write Connection Separation & Batch Coalescing:**
+   - **Isolated Read & Write Pools**: 75% of connection budget allocated to reads, 25% to writes.
+   - Read queries (`/feed`, `/posts/:id`, `/health`) are processed by dedicated read workers over `readJobs` (65k capacity). A read batch **never** contains an `INSERT` and never stalls waiting for a WAL flush.
+   - Write queries (`POST /posts`, `POST /posts/:id/like`) are processed by dedicated write workers over `writeJobs` (16k capacity), naturally group-committing in pipelined batches.
+   - Micro-linger (500 µs on sub-threshold batches) eliminates lock contention and maximizes throughput.
    - Worker goroutines reuse preallocated scratch buffers for JSON formatting, HTTP headers, and gzip compression.
    - `sendAll` enforces a 100 ms deadline to ensure slow network clients cannot starve the database worker pool.

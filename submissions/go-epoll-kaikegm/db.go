@@ -57,30 +57,53 @@ type dbJob struct {
 }
 
 type DBPool struct {
-	pool    *pgxpool.Pool
-	jobs    chan dbJob
-	started time.Time
+	readPool   *pgxpool.Pool
+	writePool  *pgxpool.Pool
+	readJobs   chan dbJob
+	writeJobs  chan dbJob
+	started    time.Time
 }
 
-func NewDBPool(pool *pgxpool.Pool, numWorkers int) *DBPool {
+func NewDBPool(readPool, writePool *pgxpool.Pool, readWorkers, writeWorkers int) *DBPool {
 	dp := &DBPool{
-		pool:    pool,
-		jobs:    make(chan dbJob, 65536),
-		started: time.Now(),
+		readPool:   readPool,
+		writePool:  writePool,
+		readJobs:   make(chan dbJob, 65536),
+		writeJobs:  make(chan dbJob, 16384),
+		started:    time.Now(),
 	}
-	for i := 0; i < numWorkers; i++ {
-		go dp.worker()
+	for i := 0; i < readWorkers; i++ {
+		go dp.readWorker()
+	}
+	for i := 0; i < writeWorkers; i++ {
+		go dp.writeWorker()
 	}
 	return dp
 }
 
 func (dp *DBPool) Submit(job dbJob) {
+	if job.jobType == JobCreatePost || job.jobType == JobLikePost {
+		select {
+		case dp.writeJobs <- job:
+		default:
+			t := time.NewTimer(200 * time.Millisecond)
+			select {
+			case dp.writeJobs <- job:
+				t.Stop()
+			case <-t.C:
+				var buf [256]byte
+				sendSyncError(int(job.fd), 500, "internal server error", buf[:0])
+			}
+		}
+		return
+	}
+
 	select {
-	case dp.jobs <- job:
+	case dp.readJobs <- job:
 	default:
 		t := time.NewTimer(200 * time.Millisecond)
 		select {
-		case dp.jobs <- job:
+		case dp.readJobs <- job:
 			t.Stop()
 		case <-t.C:
 			var buf [256]byte
@@ -89,7 +112,7 @@ func (dp *DBPool) Submit(job dbJob) {
 	}
 }
 
-func (dp *DBPool) worker() {
+func (dp *DBPool) readWorker() {
 	jsonBuf := make([]byte, 0, 16384)
 	httpBuf := make([]byte, 0, 16384)
 	var gzipBuf bytes.Buffer
@@ -99,7 +122,7 @@ func (dp *DBPool) worker() {
 	jobs := make([]dbJob, 0, 32)
 
 	for {
-		j, ok := <-dp.jobs
+		j, ok := <-dp.readJobs
 		if !ok {
 			return
 		}
@@ -108,7 +131,7 @@ func (dp *DBPool) worker() {
 	drain:
 		for len(jobs) < 32 {
 			select {
-			case j2, ok := <-dp.jobs:
+			case j2, ok := <-dp.readJobs:
 				if !ok {
 					break drain
 				}
@@ -117,7 +140,7 @@ func (dp *DBPool) worker() {
 				if len(jobs) < 16 {
 					time.Sleep(500 * time.Microsecond)
 					select {
-					case j2, ok := <-dp.jobs:
+					case j2, ok := <-dp.readJobs:
 						if !ok {
 							break drain
 						}
@@ -130,12 +153,12 @@ func (dp *DBPool) worker() {
 			}
 		}
 
-		dp.processBatch(ctx, jobs, &jsonBuf, &httpBuf, &gzipBuf, gzWriter)
+		dp.processReadBatch(ctx, jobs, &jsonBuf, &httpBuf, &gzipBuf, gzWriter)
 	}
 }
 
-func (dp *DBPool) processBatch(ctx context.Context, jobs []dbJob, jsonBuf, httpBuf *[]byte, gzipBuf *bytes.Buffer, gzWriter *gzip.Writer) {
-	conn, err := dp.pool.Acquire(ctx)
+func (dp *DBPool) processReadBatch(ctx context.Context, jobs []dbJob, jsonBuf, httpBuf *[]byte, gzipBuf *bytes.Buffer, gzWriter *gzip.Writer) {
+	conn, err := dp.readPool.Acquire(ctx)
 	if err != nil {
 		for i := range jobs {
 			*httpBuf = (*httpBuf)[:0]
@@ -161,21 +184,17 @@ func (dp *DBPool) processBatch(ctx context.Context, jobs []dbJob, jsonBuf, httpB
 			batch.Queue(feedSelect)
 		case JobGetPost:
 			batch.Queue(getPostSelect, j.postID)
-		case JobCreatePost:
-			batch.Queue(createPostQuery, j.userID, j.body)
-		case JobLikePost:
-			batch.Queue(likePostQuery, j.userID, j.postID)
 		}
 	}
 
 	br := conn.SendBatch(ctx, batch)
 	for i := range jobs {
-		dp.processResult(br, &jobs[i], jsonBuf, httpBuf, gzipBuf, gzWriter)
+		dp.processReadResult(br, &jobs[i], jsonBuf, httpBuf, gzipBuf, gzWriter)
 	}
 	_ = br.Close()
 }
 
-func (dp *DBPool) processResult(br pgx.BatchResults, job *dbJob, jsonBuf, httpBuf *[]byte, gzipBuf *bytes.Buffer, gzWriter *gzip.Writer) {
+func (dp *DBPool) processReadResult(br pgx.BatchResults, job *dbJob, jsonBuf, httpBuf *[]byte, gzipBuf *bytes.Buffer, gzWriter *gzip.Writer) {
 	*jsonBuf = (*jsonBuf)[:0]
 	*httpBuf = (*httpBuf)[:0]
 	status := 200
@@ -229,7 +248,110 @@ func (dp *DBPool) processResult(br pgx.BatchResults, job *dbJob, jsonBuf, httpBu
 			p.CreatedAt = formatTime(t)
 			*jsonBuf = formatGetPostJSON(*jsonBuf, p)
 		}
+	}
 
+	var finalBody []byte
+	if shouldGzip {
+		gzipBuf.Reset()
+		gzWriter.Reset(gzipBuf)
+		_, _ = gzWriter.Write(*jsonBuf)
+		_ = gzWriter.Close()
+		finalBody = gzipBuf.Bytes()
+	} else {
+		finalBody = *jsonBuf
+	}
+
+	*httpBuf = appendHTTPResponse(*httpBuf, status, finalBody, shouldGzip)
+	if err := sendAll(int(job.fd), *httpBuf); err != nil || job.closeAfter {
+		clearConn(int(job.fd))
+		_ = unix.Close(int(job.fd))
+	}
+}
+
+func (dp *DBPool) writeWorker() {
+	jsonBuf := make([]byte, 0, 16384)
+	httpBuf := make([]byte, 0, 16384)
+
+	ctx := context.Background()
+	jobs := make([]dbJob, 0, 32)
+
+	for {
+		j, ok := <-dp.writeJobs
+		if !ok {
+			return
+		}
+		jobs = append(jobs[:0], j)
+
+	drain:
+		for len(jobs) < 32 {
+			select {
+			case j2, ok := <-dp.writeJobs:
+				if !ok {
+					break drain
+				}
+				jobs = append(jobs, j2)
+			default:
+				if len(jobs) < 8 {
+					time.Sleep(500 * time.Microsecond)
+					select {
+					case j2, ok := <-dp.writeJobs:
+						if !ok {
+							break drain
+						}
+						jobs = append(jobs, j2)
+						continue
+					default:
+					}
+				}
+				break drain
+			}
+		}
+
+		dp.processWriteBatch(ctx, jobs, &jsonBuf, &httpBuf)
+	}
+}
+
+func (dp *DBPool) processWriteBatch(ctx context.Context, jobs []dbJob, jsonBuf, httpBuf *[]byte) {
+	conn, err := dp.writePool.Acquire(ctx)
+	if err != nil {
+		for i := range jobs {
+			*httpBuf = (*httpBuf)[:0]
+			*jsonBuf = formatErrorJSON((*jsonBuf)[:0], "db unavailable")
+			*httpBuf = appendHTTPResponse(*httpBuf, 500, *jsonBuf, false)
+			_ = sendAll(int(jobs[i].fd), *httpBuf)
+			if jobs[i].closeAfter {
+				clearConn(int(jobs[i].fd))
+				_ = unix.Close(int(jobs[i].fd))
+			}
+		}
+		return
+	}
+	defer conn.Release()
+
+	batch := &pgx.Batch{}
+	for i := range jobs {
+		j := &jobs[i]
+		switch j.jobType {
+		case JobCreatePost:
+			batch.Queue(createPostQuery, j.userID, j.body)
+		case JobLikePost:
+			batch.Queue(likePostQuery, j.userID, j.postID)
+		}
+	}
+
+	br := conn.SendBatch(ctx, batch)
+	for i := range jobs {
+		dp.processWriteResult(br, &jobs[i], jsonBuf, httpBuf)
+	}
+	_ = br.Close()
+}
+
+func (dp *DBPool) processWriteResult(br pgx.BatchResults, job *dbJob, jsonBuf, httpBuf *[]byte) {
+	*jsonBuf = (*jsonBuf)[:0]
+	*httpBuf = (*httpBuf)[:0]
+	status := 200
+
+	switch job.jobType {
 	case JobCreatePost:
 		var postID int64
 		var t time.Time
@@ -264,20 +386,9 @@ func (dp *DBPool) processResult(br pgx.BatchResults, job *dbJob, jsonBuf, httpBu
 		}
 	}
 
-	var finalBody []byte
-	if shouldGzip {
-		gzipBuf.Reset()
-		gzWriter.Reset(gzipBuf)
-		_, _ = gzWriter.Write(*jsonBuf)
-		_ = gzWriter.Close()
-		finalBody = gzipBuf.Bytes()
-	} else {
-		finalBody = *jsonBuf
-	}
-
-	*httpBuf = appendHTTPResponse(*httpBuf, status, finalBody, shouldGzip)
+	*httpBuf = appendHTTPResponse(*httpBuf, status, *jsonBuf, false)
 	if err := sendAll(int(job.fd), *httpBuf); err != nil || job.closeAfter {
-		clearConn(int(job.fd)) // Fix 6: BEFORE unix.Close
+		clearConn(int(job.fd))
 		_ = unix.Close(int(job.fd))
 	}
 }

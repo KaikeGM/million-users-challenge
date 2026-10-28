@@ -39,37 +39,63 @@ func main() {
 	procs := runtime.GOMAXPROCS(0)
 	// 512 is the spec maximum. min(384, max(128, 24*procs)):
 	// 16c -> 384, 8c -> 192, 4c -> 128.
-	pool := min(384, max(128, 24*procs))
+	totalPool := min(384, max(128, 24*procs))
 	if v := os.Getenv("DB_POOL"); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
+		if err != nil || n < 2 {
 			log.Fatalf("invalid DB_POOL %q", v)
 		}
-		pool = n
+		totalPool = n
 	}
 
-	cfg, err := pgxpool.ParseConfig(dbURL)
+	readConns := max(2, (totalPool*3)/4)
+	writeConns := max(2, totalPool-readConns)
+
+	readCfg, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		log.Fatalf("DATABASE_URL parse: %v", err)
 	}
-	cfg.MaxConns = int32(pool)
-	if cfg.ConnConfig.RuntimeParams == nil {
-		cfg.ConnConfig.RuntimeParams = make(map[string]string)
+	readCfg.MaxConns = int32(readConns)
+	if readCfg.ConnConfig.RuntimeParams == nil {
+		readCfg.ConnConfig.RuntimeParams = make(map[string]string)
 	}
-	cfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
-	cfg.ConnConfig.RuntimeParams["jit"] = "off"
+	readCfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
+	readCfg.ConnConfig.RuntimeParams["jit"] = "off"
+	readCfg.ConnConfig.RuntimeParams["max_parallel_workers_per_gather"] = "0"
+	readCfg.ConnConfig.RuntimeParams["enable_seqscan"] = "off"
+
+	writeCfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		log.Fatalf("DATABASE_URL parse: %v", err)
+	}
+	writeCfg.MaxConns = int32(writeConns)
+	if writeCfg.ConnConfig.RuntimeParams == nil {
+		writeCfg.ConnConfig.RuntimeParams = make(map[string]string)
+	}
+	writeCfg.ConnConfig.RuntimeParams["plan_cache_mode"] = "force_generic_plan"
+	writeCfg.ConnConfig.RuntimeParams["jit"] = "off"
+	writeCfg.ConnConfig.RuntimeParams["max_parallel_workers_per_gather"] = "0"
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := pgxpool.NewWithConfig(ctx, cfg)
+	readDB, err := pgxpool.NewWithConfig(ctx, readCfg)
 	if err != nil {
-		log.Fatalf("db connect: %v", err)
+		log.Fatalf("read db connect: %v", err)
 	}
-	defer db.Close()
+	defer readDB.Close()
 
-	if err := db.Ping(ctx); err != nil {
-		log.Fatalf("db ping: %v", err)
+	writeDB, err := pgxpool.NewWithConfig(ctx, writeCfg)
+	if err != nil {
+		log.Fatalf("write db connect: %v", err)
+	}
+	defer writeDB.Close()
+
+	if err := readDB.Ping(ctx); err != nil {
+		log.Fatalf("read db ping: %v", err)
+	}
+	if err := writeDB.Ping(ctx); err != nil {
+		log.Fatalf("write db ping: %v", err)
 	}
 
 	authChecker, err := NewAuthChecker(secret)
@@ -77,8 +103,9 @@ func main() {
 		log.Fatalf("auth verifier: %v", err)
 	}
 
-	dbWorkers := min(64, 4*procs)
-	dbPool := NewDBPool(db, dbWorkers)
+	readWorkers := min(48, max(2, 3*procs))
+	writeWorkers := min(16, max(2, procs))
+	dbPool := NewDBPool(readDB, writeDB, readWorkers, writeWorkers)
 
 	// Create multi-reactor epoll workers across cores
 	for i := 0; i < procs; i++ {
@@ -126,7 +153,7 @@ func main() {
 		go worker.run()
 	}
 
-	log.Printf("go-epoll-kaikegm running on %s:%s (extra %s) with %d epoll workers, %d DB workers", host, port, extraPort, procs, dbWorkers)
+	log.Printf("go-epoll-kaikegm running on %s:%s (extra %s) with %d epoll workers, %d DB workers (%d read, %d write)", host, port, extraPort, procs, readWorkers+writeWorkers, readWorkers, writeWorkers)
 
 	<-ctx.Done()
 	log.Printf("Shutting down...")
