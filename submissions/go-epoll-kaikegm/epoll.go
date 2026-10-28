@@ -136,8 +136,6 @@ func (w *Worker) run() {
 						unix.Close(nfd)
 						continue
 					}
-					_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
-					_ = unix.SetsockoptInt(nfd, unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1)
 
 					eev := unix.EpollEvent{
 						Events: unix.EPOLLIN | unix.EPOLLET | unix.EPOLLRDHUP,

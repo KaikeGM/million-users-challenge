@@ -114,8 +114,8 @@ func (dp *DBPool) worker() {
 				}
 				jobs = append(jobs, j2)
 			default:
-				if len(jobs) < 8 {
-					time.Sleep(100 * time.Microsecond)
+				if len(jobs) < 16 {
+					time.Sleep(500 * time.Microsecond)
 					select {
 					case j2, ok := <-dp.jobs:
 						if !ok {
