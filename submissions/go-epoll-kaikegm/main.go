@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sys/unix"
@@ -18,6 +19,19 @@ func envOr(name, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envMicros reads a non-negative microsecond count; 0 disables the linger.
+func envMicros(name string, fallback int) time.Duration {
+	us := fallback
+	if v := os.Getenv(name); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			log.Fatalf("invalid %s %q", name, v)
+		}
+		us = n
+	}
+	return time.Duration(us) * time.Microsecond
 }
 
 func main() {
@@ -105,7 +119,9 @@ func main() {
 
 	readWorkers := min(48, max(2, 3*procs))
 	writeWorkers := min(16, max(2, procs))
-	dbPool := NewDBPool(readDB, writeDB, readWorkers, writeWorkers)
+	readLinger := envMicros("READ_LINGER_US", 500)
+	writeLinger := envMicros("WRITE_LINGER_US", 500)
+	dbPool := NewDBPool(readDB, writeDB, readWorkers, writeWorkers, readLinger, writeLinger)
 
 	// Create multi-reactor epoll workers across cores
 	for i := 0; i < procs; i++ {

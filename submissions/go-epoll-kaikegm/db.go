@@ -57,20 +57,24 @@ type dbJob struct {
 }
 
 type DBPool struct {
-	readPool   *pgxpool.Pool
-	writePool  *pgxpool.Pool
-	readJobs   chan dbJob
-	writeJobs  chan dbJob
-	started    time.Time
+	readPool    *pgxpool.Pool
+	writePool   *pgxpool.Pool
+	readJobs    chan dbJob
+	writeJobs   chan dbJob
+	started     time.Time
+	readLinger  time.Duration
+	writeLinger time.Duration
 }
 
-func NewDBPool(readPool, writePool *pgxpool.Pool, readWorkers, writeWorkers int) *DBPool {
+func NewDBPool(readPool, writePool *pgxpool.Pool, readWorkers, writeWorkers int, readLinger, writeLinger time.Duration) *DBPool {
 	dp := &DBPool{
-		readPool:   readPool,
-		writePool:  writePool,
-		readJobs:   make(chan dbJob, 65536),
-		writeJobs:  make(chan dbJob, 16384),
-		started:    time.Now(),
+		readPool:    readPool,
+		writePool:   writePool,
+		readJobs:    make(chan dbJob, 65536),
+		writeJobs:   make(chan dbJob, 16384),
+		started:     time.Now(),
+		readLinger:  readLinger,
+		writeLinger: writeLinger,
 	}
 	for i := 0; i < readWorkers; i++ {
 		go dp.readWorker()
@@ -138,7 +142,7 @@ func (dp *DBPool) readWorker() {
 				jobs = append(jobs, j2)
 			default:
 				if len(jobs) < 16 {
-					time.Sleep(500 * time.Microsecond)
+					time.Sleep(dp.readLinger)
 					select {
 					case j2, ok := <-dp.readJobs:
 						if !ok {
@@ -292,7 +296,7 @@ func (dp *DBPool) writeWorker() {
 				jobs = append(jobs, j2)
 			default:
 				if len(jobs) < 8 {
-					time.Sleep(500 * time.Microsecond)
+					time.Sleep(dp.writeLinger)
 					select {
 					case j2, ok := <-dp.writeJobs:
 						if !ok {
