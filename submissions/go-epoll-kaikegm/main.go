@@ -77,7 +77,8 @@ func main() {
 		log.Fatalf("auth verifier: %v", err)
 	}
 
-	dbPool := NewDBPool(db, pool)
+	dbWorkers := min(64, 4*procs)
+	dbPool := NewDBPool(db, dbWorkers)
 
 	// Create multi-reactor epoll workers across cores
 	for i := 0; i < procs; i++ {
@@ -125,7 +126,7 @@ func main() {
 		go worker.run()
 	}
 
-	log.Printf("go-epoll-kaikegm running on %s:%s (extra %s) with %d epoll workers, %d DB workers", host, port, extraPort, procs, pool)
+	log.Printf("go-epoll-kaikegm running on %s:%s (extra %s) with %d epoll workers, %d DB workers", host, port, extraPort, procs, dbWorkers)
 
 	<-ctx.Done()
 	log.Printf("Shutting down...")

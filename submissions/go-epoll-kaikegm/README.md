@@ -39,7 +39,8 @@ Instead of the standard `net/http` model (1 goroutine and 2 buffered I/O streams
    - Direct byte buffer formatting for JSON responses (no reflection, zero `encoding/json` serialization overhead on hot paths).
    - `zerojwt/v2` validates token signatures and claims without heap allocations.
 
-5. **Bounded Database Worker Pool with Slow-Client Timeout:**
-   - Dedicated worker pool dimensioned as `min(384, max(128, 24 x cores))` within the 512-connection spec limit.
+5. **Bounded Database Worker Pool with Batch Coalescing & Slow-Client Timeout:**
+   - Dedicated worker pool (`min(64, 4 x cores)`) coalescing batches across a connection pool of `min(384, max(128, 24 x cores))` within the 512-connection spec limit.
+   - Micro-linger (100 µs on sub-threshold batches) and 65k channel capacity eliminate worker contention and maximize throughput.
    - Worker goroutines reuse preallocated scratch buffers for JSON formatting, HTTP headers, and gzip compression.
    - `sendAll` enforces a 100 ms deadline to ensure slow network clients cannot starve the database worker pool.

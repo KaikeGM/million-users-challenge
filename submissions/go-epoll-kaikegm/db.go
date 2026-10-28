@@ -65,7 +65,7 @@ type DBPool struct {
 func NewDBPool(pool *pgxpool.Pool, numWorkers int) *DBPool {
 	dp := &DBPool{
 		pool:    pool,
-		jobs:    make(chan dbJob, 16384),
+		jobs:    make(chan dbJob, 65536),
 		started: time.Now(),
 	}
 	for i := 0; i < numWorkers; i++ {
@@ -78,13 +78,17 @@ func (dp *DBPool) Submit(job dbJob) {
 	select {
 	case dp.jobs <- job:
 	default:
-		var buf [256]byte
-		sendSyncError(int(job.fd), 500, "internal server error", buf[:0])
+		t := time.NewTimer(200 * time.Millisecond)
+		select {
+		case dp.jobs <- job:
+			t.Stop()
+		case <-t.C:
+			var buf [256]byte
+			sendSyncError(int(job.fd), 500, "internal server error", buf[:0])
+		}
 	}
 }
 
-// worker drains up to 32 queued jobs and sends them as one pipelined batch.
-// 1 network round-trip per batch instead of per job.
 func (dp *DBPool) worker() {
 	jsonBuf := make([]byte, 0, 16384)
 	httpBuf := make([]byte, 0, 16384)
@@ -110,6 +114,18 @@ func (dp *DBPool) worker() {
 				}
 				jobs = append(jobs, j2)
 			default:
+				if len(jobs) < 8 {
+					time.Sleep(100 * time.Microsecond)
+					select {
+					case j2, ok := <-dp.jobs:
+						if !ok {
+							break drain
+						}
+						jobs = append(jobs, j2)
+						continue
+					default:
+					}
+				}
 				break drain
 			}
 		}
